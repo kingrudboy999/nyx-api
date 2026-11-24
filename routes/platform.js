@@ -941,7 +941,7 @@ function resetRate(email) {
   return null;
 }
 
-router.post('/auth/forgot-password', async (req, res, next) => {
+router.post('/password/forgot-password', async (req, res, next) => {
   try {
     const email = String(req.body?.email ?? '').trim().toLowerCase().slice(0, 120);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -972,7 +972,7 @@ router.post('/auth/forgot-password', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.post('/auth/reset-password', async (req, res, next) => {
+router.post('/password/reset-password', async (req, res, next) => {
   try {
     const email = String(req.body?.email ?? '').trim().toLowerCase().slice(0, 120);
     const code = String(req.body?.code ?? '').replace(/\s/g, '');
