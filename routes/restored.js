@@ -101,7 +101,7 @@ router.get('/flashes/received', requireUser, async (req, res, next) => {
       id: r.id, mediaUrl: r.media_url, mediaKind: r.media_kind, caption: r.caption,
       filterName: r.filter_name, durationSec: r.duration_sec, createdAt: asIso(r.created_at),
       opened: Boolean(r.opened_at),
-      sender: { username: r.username, displayName: r.display_name, avatarColor: avatarColor(r.sender_id), verified: Boolean(r.is_verified) },
+      sender: { id: r.sender_id, username: r.username, displayName: r.display_name, avatarColor: avatarColor(r.sender_id), verified: Boolean(r.is_verified) },
     })));
   } catch (err) { next(err); }
 });
@@ -138,7 +138,7 @@ router.get('/flashes/:id', requireUser, async (req, res, next) => {
     res.json({
       id: r.id, mediaUrl: r.media_url, mediaKind: r.media_kind, caption: r.caption,
       filterName: r.filter_name, durationSec: r.duration_sec, createdAt: asIso(r.created_at),
-      sender: { username: r.username, displayName: r.display_name, avatarColor: avatarColor(r.author_id), verified: Boolean(r.is_verified) },
+      sender: { id: r.author_id, username: r.username, displayName: r.display_name, avatarColor: avatarColor(r.author_id), verified: Boolean(r.is_verified) },
       mine: r.author_id === req.user.id,
     });
   } catch (err) { next(err); }
@@ -1367,13 +1367,13 @@ router.get('/stories/:id', requireUser, async (req, res, next) => {
 
 // ================= SOCIAL SAFETY (block / mute / restrict) =================
 
-function socialList(table, idCol) {
+function socialList(table, ownerCol, idCol) {
   return async (req, res, next) => {
     try {
       const { rows } = await query(
         `SELECT pr.user_id, pr.username, pr.display_name, pr.avatar_color, pr.is_verified
            FROM ${table} x JOIN profiles pr ON pr.user_id = x.${idCol}
-          WHERE x.user_id = $1 ORDER BY x.created_at DESC LIMIT 200`,
+          WHERE x.${ownerCol} = $1 ORDER BY x.created_at DESC LIMIT 200`,
         [req.user.id],
       );
       res.json(rows.map((r) => ({ id: r.user_id, username: r.username, displayName: r.display_name, avatarColor: r.avatar_color, verified: Boolean(r.is_verified) })));
@@ -1381,27 +1381,27 @@ function socialList(table, idCol) {
   };
 }
 
-router.get('/blocked', requireUser, socialList('blocks', 'blocked_id'));
+router.get('/blocked', requireUser, socialList('blocks', 'blocker_id', 'blocked_id'));
 router.get('/muted', requireUser, socialList('mutes', 'muted_id'));
 router.get('/restricted', requireUser, socialList('restrictions', 'restricted_id'));
 
-function socialToggle(table, other, col) {
+function socialToggle(table, ownerCol, col) {
   return async (req, res, next) => {
     try {
       const off = ['false', '0', 'off'].includes(String(req.body?.enabled).toLowerCase());
       const target = String(req.params.userId);
       if (off) {
-        await query(`DELETE FROM ${table} WHERE user_id = $1 AND ${col} = $2`, [req.user.id, target]);
+        await query(`DELETE FROM ${table} WHERE ${ownerCol} = $1 AND ${col} = $2`, [req.user.id, target]);
       } else {
         if (target === req.user.id) return res.status(400).json({ message: 'Cannot target yourself.' });
-        await query(`INSERT INTO ${table} (user_id, ${col}) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [req.user.id, target]);
+        await query(`INSERT INTO ${table} (${ownerCol}, ${col}) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [req.user.id, target]);
       }
       res.json({ ok: true, enabled: !off });
     } catch (err) { next(err); }
   };
 }
 
-router.post('/blocked/:userId', requireUser, socialToggle('blocks', 'blocked_id', 'blocked_id'));
+router.post('/blocked/:userId', requireUser, socialToggle('blocks', 'blocker_id', 'blocked_id'));
 router.post('/muted/:userId', requireUser, socialToggle('mutes', 'muted_id', 'muted_id'));
 router.post('/restricted/:userId', requireUser, socialToggle('restrictions', 'restricted_id', 'restricted_id'));
 

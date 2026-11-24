@@ -357,6 +357,7 @@ router.get('/inbox/threads', requireUser, async (req, res, next) => {
     );
     res.json(rows.map((r) => ({
       id: r.id, name: r.name ?? 'Conversation',
+      peerId: r.other_id ?? null,
       color: avatarColor(r.other_id ?? r.id),
       last: r.last_message_body ?? '',
       time: asIso(r.last_message_at ?? new Date()),
@@ -364,6 +365,21 @@ router.get('/inbox/threads', requireUser, async (req, res, next) => {
       online: Boolean(r.online),
       kind: r.kind, pinned: Boolean(r.pinned), favorite: Boolean(r.favorite), markedUnread: Boolean(r.marked_unread),
     })));
+  } catch (err) { next(err); }
+});
+
+router.get('/inbox/threads/:id/members', requireUser, async (req, res, next) => {
+  try {
+    const member = await query('SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2 AND banned_at IS NULL', [req.params.id, req.user.id]);
+    if (!member.rowCount) return res.status(404).json({ message: 'Conversation not found' });
+    const { rows } = await query(
+      `SELECT cm.user_id AS id, pr.username, pr.display_name, pr.avatar_color, cm.role
+         FROM conversation_members cm JOIN profiles pr ON pr.user_id = cm.user_id
+        WHERE cm.conversation_id = $1 AND cm.banned_at IS NULL
+        ORDER BY cm.joined_at ASC LIMIT 200`,
+      [req.params.id],
+    );
+    res.json(rows.map((r) => ({ id: r.id, username: r.username, displayName: r.display_name, avatarColor: r.avatar_color, role: r.role })));
   } catch (err) { next(err); }
 });
 
@@ -423,8 +439,12 @@ router.post('/inbox/threads/:id/messages', requireUser, async (req, res, next) =
     const replyToId = body.replyToId ? String(body.replyToId).slice(0, 64) : null;
     if (!text && !mediaUrl) return res.status(400).json({ message: 'Message cannot be empty.' });
     if (kind !== 'text' && !mediaUrl) return res.status(400).json({ message: 'Attach media first.' });
-    const member = await query('SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    const member = await query('SELECT role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2 AND banned_at IS NULL', [req.params.id, req.user.id]);
     if (!member.rowCount) return res.status(404).json({ message: 'Conversation not found' });
+    const bc = await query('SELECT is_broadcast FROM conversations WHERE id = $1', [req.params.id]);
+    if (bc.rows[0]?.is_broadcast && !['owner', 'admin'].includes(member.rows[0].role)) {
+      return res.status(403).json({ message: 'Only the channel owner can post.' });
+    }
     const id = rid();
     await query(
       'INSERT INTO messages (id, conversation_id, sender_id, kind, body, media_url, reply_to_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now())',
@@ -1003,7 +1023,7 @@ router.get('/studio', requireUser, async (req, res, next) => {
       avgWatch: null, // no watch-time telemetry yet — surfaced honestly as null
       renders: renders.rows.map((r) => ({
         id: r.id, title: String(r.prompt).slice(0, 70),
-        status: r.status === 'completed' || r.status === 'succeeded' || r.output_url ? 'ready' : 'rendering',
+        status: r.status === 'ready' || r.output_url ? 'ready' : r.status === 'failed' ? 'failed' : 'rendering',
         progress: null, outputUrl: r.output_url ?? null,
       })),
     });

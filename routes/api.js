@@ -26,6 +26,14 @@ export async function readFeed(tab, meId, cursor, filters = {}) {
   if (filters.media) { params.push(filters.media); filter += ` AND EXISTS (SELECT 1 FROM post_media pm2 WHERE pm2.post_id = p.id AND pm2.kind = $${params.length})`; }
   if (filters.bookmarkedBy) { params.push(filters.bookmarkedBy); filter += ` AND p.id IN (SELECT post_id FROM bookmarks WHERE user_id = $${params.length})`; }
   if (cursor) { params.push(cursor); filter += ` AND p.created_at < $${params.length}::timestamptz`; }
+  // Respect "Not interested"/hides, muted topics, and blocks (both directions).
+  filter += ` AND p.id NOT IN (SELECT target_id FROM feed_hides WHERE user_id = $1 AND target_kind = 'post')`;
+  filter += ` AND p.author_id NOT IN (SELECT target_id FROM feed_hides WHERE user_id = $1 AND target_kind = 'author')`;
+  filter += ` AND NOT EXISTS (
+    SELECT 1 FROM post_hashtags ph JOIN feed_topic_mutes m ON m.tag = ph.tag AND m.user_id = $1
+     WHERE ph.post_id = p.id)`;
+  filter += ` AND p.author_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = $1)`;
+  filter += ` AND p.author_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = $1)`;
   const boost = `(p.boosted_until IS NOT NULL AND p.boosted_until > now()) DESC`;
   const order = tab === 'trending'
     ? `${boost}, (SELECT count(*) FROM post_likes pl WHERE pl.post_id = p.id) DESC, p.created_at DESC`
@@ -51,6 +59,7 @@ export async function readFeed(tab, meId, cursor, filters = {}) {
   const items = rows.slice(0, PAGE).map((r) => ({
     id: r.id,
     author: {
+      id: r.author_id,
       username: r.username, displayName: r.display_name,
       avatarColor: avatarColor(r.author_id), verified: r.is_verified,
     },
