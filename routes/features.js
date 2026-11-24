@@ -1009,6 +1009,102 @@ router.post('/admin/reports/:id', requireUser, requireAdmin, async (req, res, ne
   } catch (err) { next(err); }
 });
 
+// ================= STICKER PACK CREATION =================
+// Creates a pack from a title + emoji list and installs it for the creator.
+router.post('/stickers', requireUser, async (req, res, next) => {
+  try {
+    const title = String(req.body?.title ?? '').trim().slice(0, 60);
+    const raw = Array.isArray(req.body?.stickers) ? req.body.stickers.map((x) => String(x).trim()).filter(Boolean) : [];
+    const stickers = [...new Set(raw)].slice(0, 60);
+    if (title.length < 2) return res.status(400).json({ message: 'Pack title required (min 2 chars).' });
+    if (stickers.length === 0) return res.status(400).json({ message: 'Add at least one sticker emoji.' });
+    for (const e of stickers) {
+      if (e.length > 16) return res.status(400).json({ message: 'Stickers must be single emoji.' });
+    }
+    const me = await query('SELECT display_name FROM profiles WHERE user_id = $1', [req.user.id]);
+    const packId = rid();
+    await query('INSERT INTO sticker_packs (id, title, author_name, created_at) VALUES ($1, $2, $3, now())',
+      [packId, title, me.rows[0]?.display_name ?? 'You']);
+    let order = 0;
+    for (const emoji of stickers) {
+      await query('INSERT INTO stickers (id, pack_id, emoji, svg, sort_order) VALUES ($1, $2, $3, $4, $5)',
+        [rid(), packId, emoji, `<text>${emoji}</text>`, order++]);
+    }
+    await query('INSERT INTO user_sticker_packs (user_id, pack_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.user.id, packId]);
+    res.status(201).json({ id: packId, title, stickers });
+  } catch (err) { next(err); }
+});
+
+// ================= NYXAI CHAT =================
+// Provider-agnostic: uses ANTHROPIC_API_KEY or OPENAI_API_KEY when configured;
+// otherwise falls back to a grounded recap built from the user's own data.
+async function nyxaiContext(userId) {
+  const [posts, views, coinsIn, followers, unread, interests] = await Promise.all([
+    query("SELECT count(*) AS n FROM posts WHERE author_id = $1 AND is_removed = false AND created_at > now() - interval '7 days'", [userId]),
+    query("SELECT count(*) AS n FROM post_views pv JOIN posts p ON p.id = pv.post_id WHERE p.author_id = $1 AND pv.created_at > now() - interval '7 days'", [userId]),
+    query("SELECT coalesce(sum(amount), 0) AS n FROM coin_ledger WHERE user_id = $1 AND direction = 'in' AND created_at > now() - interval '7 days'", [userId]),
+    query("SELECT count(*) AS n FROM follows WHERE following_id = $1 AND created_at > now() - interval '7 days'", [userId]),
+    query('SELECT count(*) AS n FROM notifications WHERE user_id = $1 AND is_read = false', [userId]),
+    query('SELECT tag FROM user_interests WHERE user_id = $1 LIMIT 8', [userId]),
+  ]);
+  return {
+    posts: Number(posts.rows[0].n),
+    views: Number(views.rows[0].n),
+    coinsIn: Number(coinsIn.rows[0].n),
+    followers: Number(followers.rows[0].n),
+    unread: Number(unread.rows[0].n),
+    interests: interests.rows.map((r) => r.tag),
+  };
+}
+
+async function callAnthropic(apiKey, system, messages) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: process.env.NYXAI_MODEL ?? 'claude-3-5-haiku-20241022', max_tokens: 600, system, messages }),
+  });
+  if (!res.ok) throw new Error(`Anthropic ${res.status}`);
+  const data = await res.json();
+  return data?.content?.find((b) => b.type === 'text')?.text ?? '';
+}
+
+async function callOpenAi(apiKey, system, messages) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: process.env.NYXAI_MODEL ?? 'gpt-4o-mini', max_tokens: 600,
+      messages: [{ role: 'system', content: system }, ...messages] }),
+  });
+  if (!res.ok) throw new Error(`OpenAI ${res.status}`);
+  const data = await res.json();
+  return data?.choices?.[0]?.message?.content ?? '';
+}
+
+router.post('/nyxai/chat', requireUser, async (req, res, next) => {
+  try {
+    const text = String(req.body?.message ?? '').trim().slice(0, 2000);
+    if (!text) return res.status(400).json({ message: 'Say something first.' });
+    const ctx = await nyxaiContext(req.user.id);
+    const system = [
+      'You are NYXAI, the assistant inside the NYX night-culture social network.',
+      'Be concise (under 120 words), warm, and concrete. Use the user context when relevant.',
+      `User context: ${ctx.posts} posts in the last 7 days, ${ctx.views} post views, +${ctx.coinsIn} coins earned, +${ctx.followers} followers, ${ctx.unread} unread notifications, interests: ${ctx.interests.join(', ') || 'not set'}.`,
+    ].join(' ');
+    const history = Array.isArray(req.body?.history) ? req.body.history.slice(-10).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content ?? '').slice(0, 1000) })) : [];
+    const messages = [...history, { role: 'user', content: text }];
+
+    let reply = null;
+    if (process.env.ANTHROPIC_API_KEY) reply = await callAnthropic(process.env.ANTHROPIC_API_KEY, system, messages);
+    else if (process.env.OPENAI_API_KEY) reply = await callOpenAi(process.env.OPENAI_API_KEY, system, messages);
+
+    if (reply == null) {
+      // Grounded fallback — real numbers from the user's data, honest wording.
+      reply = `Here's your week on NYX: you published ${ctx.posts} post${ctx.posts === 1 ? '' : 's'}, pulled in ${ctx.views} views, earned ${ctx.coinsIn} Coins and gained ${ctx.followers} follower${ctx.followers === 1 ? '' : 's'}. You have ${ctx.unread} unread notification${ctx.unread === 1 ? '' : 's'}${ctx.interests.length ? `, and your interests are ${ctx.interests.join(', ')}` : ''}. For free-form answers, an AI provider key (ANTHROPIC_API_KEY or OPENAI_API_KEY) needs to be set on the backend.`;
+    }
+    res.json({ reply, grounded: { posts: ctx.posts, views: ctx.views, coinsIn: ctx.coinsIn, followers: ctx.followers, unread: ctx.unread } });
+  } catch (err) { next(err); }
+});
+
 // ================= LIVE CHAT =================
 
 router.get('/live/:id/comments', requireUser, async (req, res, next) => {
