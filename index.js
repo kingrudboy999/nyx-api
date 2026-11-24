@@ -3,6 +3,7 @@ import express from 'express';
 import { migrate, pool } from './db.js';
 import { authHandler } from './auth.js';
 import apiRouter from './routes/api.js';
+import featuresRouter from './routes/features.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -31,6 +32,7 @@ app.all('/api/auth/*', authHandler);
 
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', apiRouter);
+app.use('/api', featuresRouter);
 
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
 // eslint-disable-next-line no-unused-vars

@@ -9,7 +9,7 @@ const FEED_TABS = new Set(['foryou', 'following', 'friends', 'trending']);
 
 const asIso = (v) => (v instanceof Date ? v.toISOString() : String(v));
 
-async function readFeed(tab, meId, cursor) {
+export async function readFeed(tab, meId, cursor, filters = {}) {
   const params = [meId];
   let filter = '';
   if (tab === 'following') {
@@ -21,6 +21,10 @@ async function readFeed(tab, meId, cursor) {
       SELECT following_id FROM follows WHERE follower_id = $${params.length}
       INTERSECT SELECT follower_id FROM follows WHERE following_id = $${params.length})`;
   }
+  if (filters.authorId) { params.push(filters.authorId); filter += ` AND p.author_id = $${params.length}`; }
+  if (filters.tag) { params.push(filters.tag); filter += ` AND p.id IN (SELECT post_id FROM post_hashtags WHERE tag = $${params.length})`; }
+  if (filters.media) { params.push(filters.media); filter += ` AND EXISTS (SELECT 1 FROM post_media pm2 WHERE pm2.post_id = p.id AND pm2.kind = $${params.length})`; }
+  if (filters.bookmarkedBy) { params.push(filters.bookmarkedBy); filter += ` AND p.id IN (SELECT post_id FROM bookmarks WHERE user_id = $${params.length})`; }
   if (cursor) { params.push(cursor); filter += ` AND p.created_at < $${params.length}::timestamptz`; }
   const order = tab === 'trending'
     ? `(SELECT count(*) FROM post_likes pl WHERE pl.post_id = p.id) DESC, p.created_at DESC`
@@ -100,7 +104,15 @@ router.get('/feed', requireUser, async (req, res, next) => {
   try {
     const tab = FEED_TABS.has(String(req.query.tab ?? 'foryou')) ? String(req.query.tab ?? 'foryou') : 'foryou';
     const cursor = typeof req.query.cursor === 'string' && req.query.cursor.trim() ? req.query.cursor.trim() : null;
-    res.json(await readFeed(tab, req.user.id, cursor));
+    const filters = {};
+    if (typeof req.query.author === 'string' && req.query.author.trim()) {
+      const row = await query('SELECT user_id FROM profiles WHERE username_lc = $1', [req.query.author.trim().toLowerCase()]);
+      if (!row.rowCount) return res.json({ items: [], nextCursor: null });
+      filters.authorId = row.rows[0].user_id;
+    }
+    if (typeof req.query.tag === 'string' && req.query.tag.trim()) filters.tag = req.query.tag.trim().replace(/^#/, '').toLowerCase();
+    if (req.query.media === 'video' || req.query.media === 'image') filters.media = req.query.media;
+    res.json(await readFeed(tab, req.user.id, cursor, filters));
   } catch (err) { next(err); }
 });
 

@@ -20,7 +20,8 @@ export async function runSeed() {
 await migrate();
 const exists = await query(`SELECT 1 FROM profiles WHERE username_lc = 'nyxai'`);
 if (exists.rowCount) {
-  console.log('[seed] demo data already present — skipping');
+  console.log('[seed] phase 1 present — ensuring phase 2');
+  await runSeedPhase2();
   return;
 }
 
@@ -211,8 +212,161 @@ for (const dm of dmDefs) {
 }
 
 console.log('[seed] demo dataset seeded. Demo login:', DEMO_EMAIL, '/', DEMO_PASSWORD);
+await runSeedPhase2();
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runSeed().then(() => pool.end()).catch(async (err) => { console.error('[seed] failed:', err); await pool.end(); process.exit(1); });
+}
+
+// ---- Phase 2: spaces/events/challenges/stickers/lists/studio renders (per-section guards, safe to re-run) ----
+export async function runSeedPhase2() {
+  const demo = await query(`SELECT user_id FROM profiles WHERE username_lc = 'you'`);
+  const DEMO_ID = demo.rows[0]?.user_id ?? null;
+  const castRow = await query(`SELECT user_id, username FROM profiles WHERE username_lc IN ('atlas_','kiki.wav','moonlit','nyxai')`);
+  const cast = Object.fromEntries(castRow.rows.map((r) => [r.username, r.user_id]));
+
+  // Communities (real counts — only the members we actually insert)
+  const hasComm = await query('SELECT 1 FROM communities LIMIT 1');
+  if (!hasComm.rowCount) {
+    const communityDefs = [
+      { name: 'Night Feed Society', tag: 'culture', desc: 'The 2am current — feed drops, rooftop sets, and what the city is listening to.', creator: 'atlas_' },
+      { name: 'Atlas tier', tag: 'music', desc: 'House, breaks and rooftop culture. Tour notes and setlists.', creator: 'atlas_' },
+      { name: 'Frame & Film', tag: 'film', desc: 'Shot on phones, developed in the dark. Share your night photography.', creator: 'frame.by.fey' },
+      { name: 'Late-night Dev', tag: 'tech', desc: 'Builders who ship after midnight. Show your work, ask for review.', creator: 'nyxai' },
+    ];
+    const communityIds = [];
+    for (const c of communityDefs) {
+      const cid = id();
+      communityIds.push([cid, c]);
+      const slug = c.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      await query(
+        `INSERT INTO communities (id, kind, slug, name, description, about, category, created_by, member_count, created_at)
+         VALUES ($1, 'community', $2, $3, $4, $4, $5, $6, 1, now())`,
+        [cid, slug, c.name, c.desc, c.tag, cast[c.creator] ?? DEMO_ID],
+      );
+      await query("INSERT INTO community_members (community_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING", [cid, cast[c.creator] ?? DEMO_ID]);
+      await query('INSERT INTO community_rules (id, community_id, title, body, sort_order) VALUES ($1, $2, $3, $4, 1)',
+        [id(), cid, 'Post the best of the night', 'Keep it loud, weird, and a little beautiful.']);
+    }
+    // a few memberships from the cast + shadow users so counts are real
+    for (const [cid, c] of communityIds) {
+      for (const other of Object.values(cast)) {
+        if (other && Math.random() < 0.75) {
+          await query('INSERT INTO community_members (community_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [cid, other, 'member']);
+        }
+      }
+      if (DEMO_ID && cast['atlas_']) {
+        await query("INSERT INTO community_members (community_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING", [cid, DEMO_ID]);
+      }
+      const count = await query('SELECT count(*) AS n FROM community_members WHERE community_id = $1', [cid]);
+      await query('UPDATE communities SET member_count = $2 WHERE id = $1', [cid, Number(count.rows[0].n)]);
+    }
+    // one seeded post with a couple of votes
+    if (DEMO_ID && communityIds[0]) {
+      const pid = id();
+      await query(
+        `INSERT INTO community_posts (id, community_id, author_id, title, body, upvotes, score, created_at) VALUES ($1, $2, $3, $4, $5, 2, 2, now() - interval '2 hours')`,
+        [pid, communityIds[0][0], cast['atlas_'] ?? DEMO_ID, 'Night market set — full tracklist', 'Rooftop run went long. Full set tonight, bring friends.'],
+      );
+    }
+    console.log('[seed] communities seeded');
+  }
+
+  // Events (upcoming, copied demo copy)
+  const hasEvent = await query('SELECT 1 FROM nyx_events LIMIT 1');
+  if (!hasEvent.rowCount && DEMO_ID) {
+    const host = cast['atlas_'] ?? DEMO_ID;
+    const events = [
+      { title: 'Rooftop Session #12', desc: 'Atlas live from the Victoria Island rooftop — two sets, one skyline.', hours: 6, loc: 'Victoria Island rooftop', host },
+      { title: 'NYX Live: Kiki — Streetlights Hum', desc: 'Streaming live on NYX. Bring headphones.', hours: 48, loc: 'Live on NYX', host: cast['kiki.wav'] ?? DEMO_ID },
+      { title: 'Creator meetup — Lagos night market', desc: 'Frame, film and print trading at the Lekki night market.', hours: 72, loc: 'Lekki night market', host: cast['moonlit'] ?? DEMO_ID },
+    ];
+    for (const e of events) {
+      const eid = id();
+      await query(
+        `INSERT INTO nyx_events (id, host_id, title, description, starts_at, location, is_online, created_at)
+         VALUES ($1, $2, $3, $4, now() + ($5 || ' hours')::interval, $6, $7, now())`,
+        [eid, e.host, e.title, e.desc, String(e.hours), e.loc, e.loc === 'Live on NYX'],
+      );
+      await query("INSERT INTO event_rsvps (event_id, user_id, status) VALUES ($1, $2, 'going') ON CONFLICT DO NOTHING", [eid, DEMO_ID]);
+      for (const other of Object.values(cast)) if (other) await query("INSERT INTO event_rsvps (event_id, user_id, status) VALUES ($1, $2, 'going') ON CONFLICT DO NOTHING", [eid, other]);
+    }
+    console.log('[seed] events seeded');
+  }
+
+  // Challenges (open, honest counters)
+  const hasChallenge = await query('SELECT 1 FROM challenges LIMIT 1');
+  if (!hasChallenge.rowCount && DEMO_ID) {
+    const challenges = [
+      { title: '7-day night streak', hashtag: 'nightfeedstreak', rules: 'Post at least one Flash a day, every day, for 7 nights. Streaks freeze once.' },
+      { title: 'Post 3 Flashes', hashtag: 'flashthree', rules: 'Three Flashes this week. Anything goes as long as it is yours.' },
+      { title: 'Streetlights Hum remix week', hashtag: 'streetlightshumremix', rules: 'Your remix, your rules — tag the hashtag, we will play the best on NYX Live.' },
+    ];
+    for (const c of challenges) {
+      await query(
+        `INSERT INTO challenges (id, creator_id, title, rules, hashtag, deadline, created_at)
+         VALUES ($1, $2, $3, $4, $5, now() + interval '14 days', now())`,
+        [id(), cast['atlas_'] ?? DEMO_ID, c.title, c.rules, c.hashtag],
+      );
+    }
+    console.log('[seed] challenges seeded');
+  }
+
+  // Sticker packs + stickers
+  const hasPack = await query('SELECT 1 FROM sticker_packs LIMIT 1');
+  if (!hasPack.rowCount) {
+    const packDefs = [
+      { title: 'Night NYX', author: 'NYX', emojis: ['🌙','✨','🛹','🌃','🎧','📼','🪩','☕','🕹️','🌆','🎛️','🌃'] },
+      { title: 'NYX Core', author: 'NYX', emojis: ['🎨','🔥','💎','⚡','🛸','🫶','🌊','⭐'] },
+      { title: 'Festival Nights', author: 'NYX', emojis: ['🎪','🎡','🪩','🎆','🎇','🕶️','🥤','🎷'] },
+    ];
+    for (const p of packDefs) {
+      const packId = id();
+      await query('INSERT INTO sticker_packs (id, title, author_name, created_at) VALUES ($1, $2, $3, now())', [packId, p.title, p.author]);
+      let order = 0;
+      for (const emoji of p.emojis) {
+        await query('INSERT INTO stickers (id, pack_id, emoji, svg, sort_order) VALUES ($1, $2, $3, $4, $5)', [id(), packId, emoji, `<text>${emoji}</text>`, order++]);
+      }
+    }
+    if (DEMO_ID) {
+      const installed = await query('SELECT id FROM sticker_packs ORDER BY created_at ASC LIMIT 2');
+      for (const row of installed.rows) await query('INSERT INTO user_sticker_packs (user_id, pack_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [DEMO_ID, row.id]);
+    }
+    console.log('[seed] stickers seeded');
+  }
+
+  // Lists for the demo account
+  const hasList = await query('SELECT 1 FROM user_lists LIMIT 1');
+  if (!hasList.rowCount && DEMO_ID) {
+    const listDefs = [
+      { name: 'Late night music', desc: 'Sets, singles and 2am frequencies.', members: ['atlas_', 'kiki.wav'] },
+      { name: 'Lagos creators', desc: 'The Lagos night feed.', members: ['atlas_', 'frame.by.fey', 'moonlit'] },
+    ];
+    for (const l of listDefs) {
+      const listId = id();
+      await query(
+        "INSERT INTO user_lists (id, owner_id, name, description, is_private, created_at, updated_at) VALUES ($1, $2, $3, $4, false, now() - interval '6 hours', now() - interval '3 hours')",
+        [listId, DEMO_ID, l.name, l.desc],
+      );
+      for (const u of l.members) {
+        if (cast[u]) await query('INSERT INTO user_list_members (list_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [listId, cast[u]]);
+      }
+    }
+    console.log('[seed] lists seeded');
+  }
+
+  // Studio render jobs (one done, one in-flight)
+  const hasJob = await query('SELECT 1 FROM nyx_video_jobs LIMIT 1');
+  if (!hasJob.rowCount && DEMO_ID) {
+    await query(
+      `INSERT INTO nyx_video_jobs (id, user_id, provider, model, prompt, status, output_url, created_at, completed_at) VALUES ($1, $2, 'runway', 'gen3a', 'Streetlights Hum — teaser, 9s', 'succeeded', NULL, now() - interval '2 days', now() - interval '2 days')`,
+      [id(), DEMO_ID],
+    );
+    await query(
+      `INSERT INTO nyx_video_jobs (id, user_id, provider, model, prompt, status, created_at) VALUES ($1, $2, 'runway', 'gen3a', 'Rooftop set — full cut', 'rendering', now() - interval '1 hour')`,
+      [id(), DEMO_ID],
+    );
+    console.log('[seed] studio jobs seeded');
+  }
 }
