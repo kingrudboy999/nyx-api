@@ -30,7 +30,7 @@ export const auth = betterAuth({
   secret: env('BETTER_AUTH_SECRET') ?? 'INSECURE-DEV-SECRET-CHANGE-ME',
   database: pool,
   emailAndPassword,
-  trustedOrigins: [baseURL, env('NYX_WEB_ORIGIN'), 'http://localhost:8081', 'http://localhost:8080', 'nyx://'].filter(Boolean),
+  trustedOrigins: [baseURL, env('NYX_WEB_ORIGIN'), 'https://nyx-azure.vercel.app', 'http://localhost:8081', 'http://localhost:8080', 'nyx://'].filter(Boolean),
   session: { cookieCache: { enabled: true, maxAge: 300 } },
   advanced: {
     useSecureCookies: false,
