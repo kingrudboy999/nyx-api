@@ -356,6 +356,28 @@ export async function runSeedPhase2() {
     console.log('[seed] lists seeded');
   }
 
+  // Sounds catalog (original night catalog) — only when the table is empty
+  const hasSounds = await query('SELECT 1 FROM sounds LIMIT 1');
+  if (!hasSounds.rowCount) {
+    const soundDefs = [
+      { title: 'Streetlights Hum (instrumental)', artist: 'atlas_', ms: 214000, uses: 187 },
+      { title: 'Rooftop siren — live cut', artist: 'atlas_', ms: 183000, uses: 154 },
+      { title: '2am Amapiano Pressure', artist: 'kiki.wav', ms: 247000, uses: 231 },
+      { title: 'Night market after dark', artist: 'frame.by.fey', ms: 198000, uses: 98 },
+      { title: 'Vinyl crackle & moonlit talk', artist: 'moonlit', ms: 226000, uses: 140 },
+      { title: 'Grindcore love letter', artist: 'night_owl_2', ms: 171000, uses: 76 },
+      { title: 'Harbor static (slowed)', artist: 'wave.exe', ms: 242000, uses: 118 },
+      { title: 'Last bus home', artist: 'atlas_', ms: 205000, uses: 165 },
+    ];
+    for (const sd of soundDefs) {
+      await query(
+        "INSERT INTO sounds (id, author_id, title, artist, duration_ms, use_count, original, created_at) VALUES ($1, $2, $3, $4, $5, $6, true, now() - random() * interval '20 days')",
+        [id(), DEMO_ID ? DEMO_ID : null, sd.title, sd.artist, sd.ms, sd.uses],
+      );
+    }
+    console.log('[seed] sounds seeded');
+  }
+
   // Studio render jobs (one done, one in-flight)
   const hasJob = await query('SELECT 1 FROM nyx_video_jobs LIMIT 1');
   if (!hasJob.rowCount && DEMO_ID) {

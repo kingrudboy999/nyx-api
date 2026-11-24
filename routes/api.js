@@ -26,9 +26,10 @@ export async function readFeed(tab, meId, cursor, filters = {}) {
   if (filters.media) { params.push(filters.media); filter += ` AND EXISTS (SELECT 1 FROM post_media pm2 WHERE pm2.post_id = p.id AND pm2.kind = $${params.length})`; }
   if (filters.bookmarkedBy) { params.push(filters.bookmarkedBy); filter += ` AND p.id IN (SELECT post_id FROM bookmarks WHERE user_id = $${params.length})`; }
   if (cursor) { params.push(cursor); filter += ` AND p.created_at < $${params.length}::timestamptz`; }
+  const boost = `(p.boosted_until IS NOT NULL AND p.boosted_until > now()) DESC`;
   const order = tab === 'trending'
-    ? `(SELECT count(*) FROM post_likes pl WHERE pl.post_id = p.id) DESC, p.created_at DESC`
-    : 'p.created_at DESC';
+    ? `${boost}, (SELECT count(*) FROM post_likes pl WHERE pl.post_id = p.id) DESC, p.created_at DESC`
+    : `${boost}, p.created_at DESC`;
 
   const { rows } = await query(
     `SELECT p.id, p.body, p.created_at, p.edited_at,

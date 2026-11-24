@@ -326,7 +326,7 @@ router.post('/stories/:id/view', requireUser, async (req, res, next) => {
 router.get('/inbox/threads', requireUser, async (req, res, next) => {
   try {
     const { rows } = await query(
-      `SELECT c.id, c.kind, c.title, c.last_message_at, c.last_message_body,
+      `SELECT c.id, c.kind, c.title, c.last_message_at, c.last_message_body, m.pinned,
               (SELECT count(*) FROM messages msg
                 WHERE msg.conversation_id = c.id AND msg.sender_id <> $1 AND msg.deleted_at IS NULL
                   AND msg.created_at > coalesce(m.last_read_at, '-infinity'::timestamptz)) AS unread,
@@ -347,7 +347,7 @@ router.get('/inbox/threads', requireUser, async (req, res, next) => {
          FROM conversations c
          JOIN conversation_members m ON m.conversation_id = c.id AND m.user_id = $1
         WHERE m.archived = false
-        ORDER BY coalesce(c.last_message_at, c.created_at) DESC
+        ORDER BY m.pinned DESC, coalesce(c.last_message_at, c.created_at) DESC
         LIMIT 50`,
       [req.user.id],
     );
@@ -358,7 +358,7 @@ router.get('/inbox/threads', requireUser, async (req, res, next) => {
       time: asIso(r.last_message_at ?? new Date()),
       unread: Number(r.unread) || 0,
       online: Boolean(r.online),
-      kind: r.kind,
+      kind: r.kind, pinned: Boolean(r.pinned),
     })));
   } catch (err) { next(err); }
 });
@@ -368,31 +368,68 @@ router.get('/inbox/threads/:id/messages', requireUser, async (req, res, next) =>
     const member = await query('SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [req.params.id, req.user.id]);
     if (!member.rowCount) return res.status(404).json({ message: 'Conversation not found' });
     const { rows } = await query(
-      `SELECT id, sender_id, kind, body, created_at
+      `SELECT id, sender_id, kind, body, media_url, reply_to_id, edited_at, created_at
          FROM messages WHERE conversation_id = $1 AND deleted_at IS NULL
         ORDER BY created_at ASC LIMIT 200`,
       [req.params.id],
     );
-    res.json(rows.map((r) => ({
-      id: r.id, from: r.sender_id === req.user.id ? 'me' : 'them',
-      text: r.body, kind: r.kind, time: asIso(r.created_at),
-    })));
+    const ids = rows.map((r) => r.id);
+    let reactions = [], opens = [];
+    if (ids.length) {
+      reactions = (await query(
+        `SELECT message_id, emoji, count(*)::int AS n, bool_or(user_id = $2) AS mine
+           FROM message_reactions WHERE message_id = ANY($1) GROUP BY message_id, emoji`,
+        [ids, req.user.id],
+      )).rows;
+      opens = (await query(
+        `SELECT message_id, count(*)::int AS n, bool_or(user_id = $2) AS mine
+           FROM view_once_opens WHERE message_id = ANY($1) GROUP BY message_id`,
+        [ids, req.user.id],
+      )).rows;
+    }
+    const byMsg = new Map(), openByMsg = new Map();
+    for (const r of reactions) {
+      const arr = byMsg.get(r.message_id) ?? [];
+      arr.push({ emoji: r.emoji, count: r.n, mine: r.mine });
+      byMsg.set(r.message_id, arr);
+    }
+    for (const o of opens) openByMsg.set(o.message_id, { total: o.n, mine: Boolean(o.mine) });
+    res.json(rows.map((r) => {
+      const isVO = String(r.kind).startsWith('view_once_');
+      const o = openByMsg.get(r.id);
+      return {
+        id: r.id, from: r.sender_id === req.user.id ? 'me' : 'them',
+        text: r.body, kind: r.kind, time: asIso(r.created_at),
+        mediaUrl: isVO ? null : (r.media_url ?? null),
+        replyToId: r.reply_to_id ?? null,
+        editedAt: r.edited_at ? asIso(r.edited_at) : null,
+        reactions: byMsg.get(r.id) ?? [],
+        ...(isVO ? { viewOnce: { openedTotal: o?.total ?? 0, openedByMe: Boolean(o?.mine) } } : {}),
+      };
+    }));
   } catch (err) { next(err); }
 });
 
 router.post('/inbox/threads/:id/messages', requireUser, async (req, res, next) => {
   try {
-    const text = String(req.body?.text ?? '').trim().slice(0, 4000);
-    if (!text) return res.status(400).json({ message: 'Message cannot be empty.' });
+    const body = req.body ?? {};
+    const kind = ['text', 'image', 'view_once_photo', 'view_once_video'].includes(String(body.kind)) ? String(body.kind) : 'text';
+    const text = String(body.text ?? '').trim().slice(0, 4000);
+    const mediaUrl = body.mediaUrl ? String(body.mediaUrl).slice(0, 1500000) : null;
+    const replyToId = body.replyToId ? String(body.replyToId).slice(0, 64) : null;
+    if (!text && !mediaUrl) return res.status(400).json({ message: 'Message cannot be empty.' });
+    if (kind !== 'text' && !mediaUrl) return res.status(400).json({ message: 'Attach media first.' });
     const member = await query('SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [req.params.id, req.user.id]);
     if (!member.rowCount) return res.status(404).json({ message: 'Conversation not found' });
     const id = rid();
     await query(
-      "INSERT INTO messages (id, conversation_id, sender_id, kind, body, created_at) VALUES ($1, $2, $3, 'text', $4, now())",
-      [id, req.params.id, req.user.id, text],
+      'INSERT INTO messages (id, conversation_id, sender_id, kind, body, media_url, reply_to_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now())',
+      [id, req.params.id, req.user.id, kind, text, mediaUrl, replyToId],
     );
-    await query('UPDATE conversations SET last_message_at = now(), last_message_body = $2 WHERE id = $1', [req.params.id, text.slice(0, 120)]);
-    res.status(201).json({ id, from: 'me', text, kind: 'text', time: new Date().toISOString() });
+    const preview = text || (kind === 'view_once_video' ? 'View-once video' : kind === 'view_once_photo' ? 'View-once photo' : 'Photo');
+    await query('UPDATE conversations SET last_message_at = now(), last_message_body = $2 WHERE id = $1', [req.params.id, preview.slice(0, 120)]);
+    const isVO = kind.startsWith('view_once_');
+    res.status(201).json({ id, from: 'me', text, kind, time: new Date().toISOString(), mediaUrl: isVO ? null : mediaUrl, replyToId, reactions: [], ...(isVO ? { viewOnce: { openedTotal: 0, openedByMe: false } } : {}) });
   } catch (err) { next(err); }
 });
 
