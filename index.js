@@ -24,7 +24,7 @@ app.use((req, res, next) => {
 });
 
 // Public health check (used for smoke tests + Railway deploy checks).
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'nyx-api' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'nyx-api', version: '1.0.2' }));
 
 // Better Auth owns /api/auth/* (parses its own body — keep before json parser).
 app.all('/api/auth/*', authHandler);
