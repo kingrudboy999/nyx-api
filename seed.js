@@ -183,9 +183,11 @@ for (const n of notifDefs) {
 
 // ---- 9) DMs: atlas (2 unread) + kiki (1 unread) ----
 const dmDefs = [
-  { partner: 'atlas_', unread: 2, lines: [['them', 'yo, you up?', 11], ['me', 'always after midnight', 10], ['them', 'the rooftop clip is wild, watch it', 2]] },
-  { partner: 'kiki.wav', unread: 1, lines: [['them', 'new single drops at midnight', 20], ['me', 'on it. setting an alarm', 18]] },
+  { partner: 'atlas_', lines: [['them', 'yo, you up?', 30], ['me', 'always after midnight', 28], ['them', 'the rooftop clip is wild, watch it', 12]] },
+  { partner: 'kiki.wav', lines: [['them', 'new single drops at midnight', 25], ['me', 'on it. setting an alarm', 22]] },
+  { partner: 'moonlit', lines: [['them', '2am feed check — come say hi', 8]] },
 ];
+// last_read is set 1h ago so every seeded partner message is unread.
 for (const dm of dmDefs) {
   const cid = id();
   await query(
@@ -193,7 +195,7 @@ for (const dm of dmDefs) {
     [cid, castId[dm.partner]],
   );
   await query(
-    `INSERT INTO conversation_members (conversation_id, user_id, role, last_read_at, joined_at) VALUES ($1, $2, 'member', now() - interval '10 minutes', now() - interval '3 hours')`,
+    `INSERT INTO conversation_members (conversation_id, user_id, role, last_read_at, joined_at) VALUES ($1, $2, 'member', now() - interval '1 hour', now() - interval '3 hours')`,
     [cid, DEMO_ID],
   );
   await query(
