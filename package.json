@@ -2,9 +2,11 @@
   "name": "nyx-api",
   "version": "1.0.0",
   "private": true,
-  "description": "NYX backend API — Postgres + Better Auth REST parity for the RN client",
+  "description": "NYX backend API \u2014 Postgres + Better Auth REST parity for the RN client",
   "type": "module",
-  "engines": { "node": ">=18.17" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node index.js",
     "migrate": "node migrate.js",

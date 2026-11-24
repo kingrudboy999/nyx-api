@@ -4,6 +4,7 @@
  * the night-feed creator cast, and real rows (posts, likes, comments,
  * stories, live streams, notifications, DMs) mirroring the app's demo copy.
  */
+import './polyfill.js';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { pool, query, migrate } from './db.js';

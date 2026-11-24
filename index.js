@@ -1,3 +1,4 @@
+import './polyfill.js';
 import express from 'express';
 import { migrate, pool } from './db.js';
 import { authHandler } from './auth.js';

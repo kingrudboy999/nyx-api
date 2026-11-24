@@ -1,3 +1,4 @@
+import './polyfill.js';
 import { betterAuth } from 'better-auth';
 import { bearer } from 'better-auth/plugins';
 import { toNodeHandler } from 'better-auth/node';
