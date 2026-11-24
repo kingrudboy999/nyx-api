@@ -923,4 +923,89 @@ router.get('/phone', requireUser, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+/* ================= Password reset OTP (6-digit, SMTP-gated) ================= */
+/* Ports the old forgot-password flow: rate limits, attempt cap, TTL, sessions revoked.
+   Without SMTP_URL configured the request endpoint refuses with 503 — never faked. */
+const RESET_TTL_MIN = 10;
+const RESET_MAX_ATTEMPTS = 5;
+const resetLimiter = new Map(); // email_lc -> { n, windowStart, lastRequest }
+function resetRate(email) {
+  const now = Date.now();
+  const e = resetLimiter.get(email) ?? { n: 0, windowStart: now, lastRequest: 0 };
+  if (now - e.windowStart > 15 * 60_000) { e.n = 0; e.windowStart = now; }
+  const perMin = e.lastRequest && now - e.lastRequest < 60_000;
+  e.n += 1; e.lastRequest = now;
+  resetLimiter.set(email, e);
+  if (e.n > 3) return 'Too many reset requests. Try again in 15 minutes.';
+  if (perMin) return 'Wait a minute before requesting another code.';
+  return null;
+}
+
+router.post('/auth/forgot-password', async (req, res, next) => {
+  try {
+    const email = String(req.body?.email ?? '').trim().toLowerCase().slice(0, 120);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ message: 'Enter a valid email address.' });
+    }
+    const limited = resetRate(email);
+    if (limited) return res.status(429).json({ message: limited });
+    if (!process.env.SMTP_URL?.trim()) {
+      return res.status(503).json({ message: 'Password reset mail is not configured on this deployment. Ask the admin to set SMTP_URL.' });
+    }
+    const { rows } = await query('SELECT id, email FROM "user" WHERE lower(email) = $1 LIMIT 1', [email]);
+    const user = rows[0];
+    const GENERIC = { ok: true, message: "If an account exists for this email address, we'll send a password reset code." };
+    if (!user?.id) return res.json(GENERIC); // do not reveal account existence
+    const code = genOtp();
+    await query('UPDATE password_reset_otps SET used_at = now() WHERE email_lc = $1 AND used_at IS NULL', [email]);
+    await query(
+      "INSERT INTO password_reset_otps (id, email_lc, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4, now() + interval '10 minutes')",
+      [rid(), email, user.id, sha256(code)],
+    );
+    try {
+      await sendMail(user.email, 'Your NYX password reset code',
+        `Your NYX password reset code is ${code}. It expires in ${RESET_TTL_MIN} minutes. If you didn't ask for it, you can ignore this email.`);
+    } catch (err) {
+      return res.status(502).json({ message: 'Could not send the reset email. Check the server mail configuration.' });
+    }
+    res.json(GENERIC);
+  } catch (err) { next(err); }
+});
+
+router.post('/auth/reset-password', async (req, res, next) => {
+  try {
+    const email = String(req.body?.email ?? '').trim().toLowerCase().slice(0, 120);
+    const code = String(req.body?.code ?? '').replace(/\s/g, '');
+    const password = String(req.body?.newPassword ?? req.body?.password ?? '');
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ message: 'Enter the 6-digit code from the email.' });
+    if (password.length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters.' });
+    const { rows } = await query(
+      'SELECT id, user_id, code_hash, attempts, expires_at FROM password_reset_otps WHERE email_lc = $1 AND used_at IS NULL ORDER BY created_at DESC LIMIT 1',
+      [email],
+    );
+    const row = rows[0];
+    if (!row || !row.user_id) return res.status(400).json({ message: 'That code is not valid.' });
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      await query('UPDATE password_reset_otps SET used_at = now() WHERE id = $1', [row.id]);
+      return res.status(400).json({ message: 'That code has expired. Request a new one.' });
+    }
+    if (row.attempts >= RESET_MAX_ATTEMPTS) {
+      await query('UPDATE password_reset_otps SET used_at = now() WHERE id = $1', [row.id]);
+      return res.status(429).json({ message: 'Too many attempts. Request a new code.' });
+    }
+    if (row.code_hash !== sha256(code)) {
+      await query('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [row.id]);
+      return res.status(400).json({ message: 'That code is not valid.' });
+    }
+    // Hash the new password exactly the way better-auth hashes credential passwords.
+    const { auth } = await import('../auth.js');
+    const ctx = await auth.$context;
+    const hashed = await ctx.password.hash(password);
+    await query('UPDATE account SET password = $1 WHERE "userId" = $2 AND "providerId" = $3', [hashed, row.user_id, 'credential']);
+    await query('DELETE FROM session WHERE "userId" = $1', [row.user_id]); // force re-login everywhere
+    await query('UPDATE password_reset_otps SET used_at = now() WHERE email_lc = $1 AND used_at IS NULL', [email]);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
 export default router;

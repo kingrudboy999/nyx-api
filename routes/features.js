@@ -30,7 +30,9 @@ async function postById(id, meId) {
             (SELECT count(*) FROM post_likes pl WHERE pl.post_id = p.id) AS likes,
             (SELECT count(*) FROM comments c WHERE c.post_id = p.id AND c.is_removed = false) AS comments,
             (SELECT count(*) FROM posts r WHERE r.repost_of_id = p.id) AS reposts,
-            EXISTS (SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = $2) AS liked
+            EXISTS (SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = $2) AS liked,
+            (SELECT kind FROM post_media pm WHERE pm.post_id = p.id ORDER BY pm.sort_order, pm.id LIMIT 1) AS media_kind,
+            (SELECT url FROM post_media pm WHERE pm.post_id = p.id ORDER BY pm.sort_order, pm.id LIMIT 1) AS media_url
        FROM posts p JOIN profiles pr ON pr.user_id = p.author_id
       WHERE p.id = $1`,
     [id, meId],
@@ -42,6 +44,8 @@ async function postById(id, meId) {
     author: mapPostAuthor(r),
     likes: Number(r.likes), comments: Number(r.comments), reposts: Number(r.reposts),
     views: Number(r.view_count) || 0, liked: Boolean(r.liked),
+    media: r.media_kind === 'video' ? 'video' : r.media_kind === 'image' ? 'image' : undefined,
+    mediaUrl: r.media_url ?? undefined,
   };
 }
 
