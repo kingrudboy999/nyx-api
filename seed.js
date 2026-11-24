@@ -223,7 +223,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export async function runSeedPhase2() {
   const demo = await query(`SELECT user_id FROM profiles WHERE username_lc = 'you'`);
   const DEMO_ID = demo.rows[0]?.user_id ?? null;
-  const castRow = await query(`SELECT user_id, username FROM profiles WHERE username_lc IN ('atlas_','kiki.wav','moonlit','nyxai')`);
+  const castRow = await query(`SELECT user_id, username FROM profiles WHERE username_lc IN ('atlas_','kiki.wav','moonlit','nyxai','frame.by.fey','waveform_')`);
   const cast = Object.fromEntries(castRow.rows.map((r) => [r.username, r.user_id]));
 
   // Communities (real counts — only the members we actually insert)
@@ -249,14 +249,14 @@ export async function runSeedPhase2() {
       await query('INSERT INTO community_rules (id, community_id, title, body, sort_order) VALUES ($1, $2, $3, $4, 1)',
         [id(), cid, 'Post the best of the night', 'Keep it loud, weird, and a little beautiful.']);
     }
-    // a few memberships from the cast + shadow users so counts are real
+    // cast membership is deterministic: everyone joins every cast-made community except their own
     for (const [cid, c] of communityIds) {
-      for (const other of Object.values(cast)) {
-        if (other && Math.random() < 0.75) {
+      for (const [name, other] of Object.entries(cast)) {
+        if (other && name !== c.creator) {
           await query('INSERT INTO community_members (community_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [cid, other, 'member']);
         }
       }
-      if (DEMO_ID && cast['atlas_']) {
+      if (DEMO_ID) {
         await query("INSERT INTO community_members (community_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING", [cid, DEMO_ID]);
       }
       const count = await query('SELECT count(*) AS n FROM community_members WHERE community_id = $1', [cid]);
