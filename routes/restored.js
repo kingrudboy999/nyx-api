@@ -1025,4 +1025,425 @@ router.post('/live/:id/gift', requireUser, async (req, res, next) => {
   } finally { client.release(); }
 });
 
+
+// ================= POST MEDIA =================
+
+router.post('/posts/:id/media', requireUser, async (req, res, next) => {
+  try {
+    const kind = req.body?.kind === 'video' ? 'video' : 'image';
+    const url = String(req.body?.url ?? '');
+    if (!url || url.length > 1_500_000) return res.status(400).json({ message: 'Media is missing or too large.' });
+    const own = await query('SELECT 1 FROM posts WHERE id = $1 AND author_id = $2 AND is_removed = false', [req.params.id, req.user.id]);
+    if (!own.rowCount) return res.status(404).json({ message: 'Post not found' });
+    const count = await query('SELECT count(*)::int AS n FROM post_media WHERE post_id = $1', [req.params.id]);
+    if (count.rows[0].n >= 4) return res.status(400).json({ message: 'Up to 4 attachments per post.' });
+    const id = rid();
+    await query(
+      'INSERT INTO post_media (id, post_id, kind, url, thumb_url, width, height, sort_order) VALUES ($1,$2,$3,$4,NULL,$5,$6,$7)',
+      [id, req.params.id, kind, url, Number(req.body?.width) || null, Number(req.body?.height) || null, count.rows[0].n],
+    );
+    res.status(201).json({ id, sortOrder: count.rows[0].n });
+  } catch (err) { next(err); }
+});
+// ================= DRAFTS =================
+
+router.get('/drafts', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      'SELECT id, payload, updated_at FROM video_drafts WHERE author_id = $1 ORDER BY updated_at DESC LIMIT 30',
+      [req.user.id],
+    );
+    res.json(rows.map((r) => ({ id: r.id, payload: r.payload ?? {}, updatedAt: asIso(r.updated_at) })));
+  } catch (err) { next(err); }
+});
+
+router.post('/drafts', requireUser, async (req, res, next) => {
+  try {
+    const payload = req.body?.payload && typeof req.body.payload === 'object' ? req.body.payload : {};
+    const body = String(payload.body ?? '').slice(0, 2800);
+    if (!body.trim() && !payload.mediaUrl) return res.status(400).json({ message: 'Nothing to save yet.' });
+    const id = rid();
+    await query('INSERT INTO video_drafts (id, author_id, payload) VALUES ($1,$2,$3::jsonb)', [id, req.user.id, JSON.stringify({ tab: payload.tab ?? 'post', body, mediaUrl: payload.mediaUrl ?? null, location: payload.location ?? null, savedAt: new Date().toISOString() })]);
+    res.status(201).json({ id });
+  } catch (err) { next(err); }
+});
+
+router.delete('/drafts/:id', requireUser, async (req, res, next) => {
+  try {
+    const { rowCount } = await query('DELETE FROM video_drafts WHERE id = $1 AND author_id = $2', [req.params.id, req.user.id]);
+    res.json({ ok: rowCount > 0 });
+  } catch (err) { next(err); }
+});
+
+// ================= STATUSES (24h) =================
+
+async function mutualFriendIds(userId) {
+  const { rows } = await query(
+    `SELECT following_id FROM follows WHERE follower_id = $1
+     INTERSECT SELECT follower_id FROM follows WHERE following_id = $1`,
+    [userId],
+  );
+  return rows.map((r) => r.following_id);
+}
+
+router.get('/statuses', requireUser, async (req, res, next) => {
+  try {
+    const me = req.user.id;
+    const friendIds = await mutualFriendIds(me);
+    const { rows } = await query(
+      `SELECT s.id, s.author_id, s.media_url, s.media_kind, s.text_body, s.background, s.audience, s.expires_at, s.created_at,
+              pr.username, pr.display_name, pr.avatar_color, pr.is_verified
+         FROM statuses s JOIN profiles pr ON pr.user_id = s.author_id
+        WHERE s.expires_at > now()
+          AND (s.author_id = $1 OR s.audience = 'everyone'
+               OR (s.audience = 'friends' AND s.author_id = ANY($2::text[]))
+               OR (s.audience = 'only' AND EXISTS (SELECT 1 FROM status_audience sa WHERE sa.status_id = s.id AND sa.user_id = $1 AND sa.mode = 'only'))
+               OR (s.audience = 'except' AND NOT EXISTS (SELECT 1 FROM status_audience sa WHERE sa.status_id = s.id AND sa.user_id = $1 AND sa.mode = 'except') AND s.author_id = ANY($2::text[])))
+        ORDER BY s.created_at DESC LIMIT 60`,
+      [me, friendIds],
+    );
+    const viewed = rows.length
+      ? (await query('SELECT status_id FROM status_views WHERE user_id = $1 AND status_id = ANY($2::text[])', [me, rows.map((r) => r.id)])).rows.map((r) => r.status_id)
+      : [];
+    const viewedSet = new Set(viewed);
+    res.json(rows.map((r) => ({
+      id: r.id, authorId: r.author_id, username: r.username, displayName: r.display_name,
+      avatarColor: r.avatar_color, verified: r.is_verified,
+      mediaKind: r.media_kind, mediaUrl: r.media_url, textBody: r.text_body, background: r.background,
+      audience: r.audience, createdAt: asIso(r.created_at), expiresAt: asIso(r.expires_at),
+      mine: r.author_id === me, seen: viewedSet.has(r.id),
+    })));
+  } catch (err) { next(err); }
+});
+
+router.get('/statuses/mine', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, media_url, media_kind, text_body, background, audience, expires_at, created_at
+         FROM statuses WHERE author_id = $1 AND expires_at > now() ORDER BY created_at DESC LIMIT 20`,
+      [req.user.id],
+    );
+    const ids = rows.map((r) => r.id);
+    const views = ids.length
+      ? (await query('SELECT status_id, count(*)::int AS n FROM status_views WHERE status_id = ANY($1::text[]) GROUP BY status_id', [ids])).rows
+      : [];
+    const viewMap = Object.fromEntries(views.map((v) => [v.status_id, v.n]));
+    res.json(rows.map((r) => ({
+      id: r.id, mediaKind: r.media_kind, mediaUrl: r.media_url, textBody: r.text_body, background: r.background,
+      audience: r.audience, createdAt: asIso(r.created_at), expiresAt: asIso(r.expires_at), views: viewMap[r.id] ?? 0,
+    })));
+  } catch (err) { next(err); }
+});
+
+router.post('/statuses', requireUser, async (req, res, next) => {
+  try {
+    const mediaKind = ['text', 'photo', 'video'].includes(req.body?.mediaKind) ? req.body.mediaKind : 'text';
+    const mediaUrl = req.body?.mediaUrl ? String(req.body.mediaUrl).slice(0, 1_500_000) : null;
+    const textBody = String(req.body?.textBody ?? '').trim().slice(0, 500);
+    const background = req.body?.background ? String(req.body.background).slice(0, 32) : '#0d1420';
+    const audience = ['everyone', 'friends', 'only', 'except'].includes(req.body?.audience) ? req.body.audience : 'friends';
+    if (mediaKind === 'text' && !textBody) return res.status(400).json({ message: 'Write something for your status.' });
+    if (mediaKind !== 'text' && !mediaUrl) return res.status(400).json({ message: 'Media is missing.' });
+    const id = rid();
+    await query(
+      `INSERT INTO statuses (id, author_id, media_url, media_kind, text_body, background, audience, expires_at, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7, now() + interval '24 hours', now())`,
+      [id, req.user.id, mediaUrl, mediaKind === 'photo' ? 'photo' : mediaKind, textBody || null, background, audience],
+    );
+    const pick = (arr) => [...new Set((Array.isArray(arr) ? arr : []).map(String))].slice(0, 200);
+    const ids = audience === 'only' ? pick(req.body?.onlyUserIds) : audience === 'except' ? pick(req.body?.exceptUserIds) : [];
+    for (const uid of ids) {
+      await query('INSERT INTO status_audience (status_id, user_id, mode) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [id, uid, audience]);
+    }
+    res.status(201).json({ id });
+  } catch (err) { next(err); }
+});
+
+router.post('/statuses/:id/view', requireUser, async (req, res, next) => {
+  try {
+    await query('INSERT INTO status_views (status_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.params.id, req.user.id]);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+router.get('/statuses/:id', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT s.id, s.author_id, s.media_url, s.media_kind, s.text_body, s.background, s.audience, s.expires_at, s.created_at,
+              pr.username, pr.display_name, pr.avatar_color, pr.is_verified
+         FROM statuses s JOIN profiles pr ON pr.user_id = s.author_id
+        WHERE s.id = $1 AND s.expires_at > now()`,
+      [req.params.id],
+    );
+    if (!rows.length) return res.status(404).json({ message: 'That status has expired.' });
+    const r = rows[0];
+    const views = await query('SELECT count(*)::int AS n FROM status_views WHERE status_id = $1', [req.params.id]);
+    res.json({
+      id: r.id, authorId: r.author_id, username: r.username, displayName: r.display_name,
+      avatarColor: r.avatar_color, verified: r.is_verified,
+      mediaKind: r.media_kind, mediaUrl: r.media_url, textBody: r.text_body, background: r.background,
+      audience: r.audience, createdAt: asIso(r.created_at), expiresAt: asIso(r.expires_at),
+      views: views.rows[0].n, mine: r.author_id === req.user.id,
+    });
+  } catch (err) { next(err); }
+});
+
+router.get('/statuses/:id/viewers', requireUser, async (req, res, next) => {
+  try {
+    const own = await query('SELECT 1 FROM statuses WHERE id = $1 AND author_id = $2', [req.params.id, req.user.id]);
+    if (!own.rowCount) return res.status(404).json({ message: 'Only the author can see viewers.' });
+    const { rows } = await query(
+      `SELECT sv.user_id, sv.created_at, pr.username, pr.display_name, pr.avatar_color, pr.is_verified
+         FROM status_views sv JOIN profiles pr ON pr.user_id = sv.user_id
+        WHERE sv.status_id = $1 ORDER BY sv.created_at DESC LIMIT 100`,
+      [req.params.id],
+    );
+    res.json(rows.map((r) => ({ id: r.user_id, username: r.username, displayName: r.display_name, avatarColor: r.avatar_color, verified: r.is_verified, viewedAt: asIso(r.created_at) })));
+  } catch (err) { next(err); }
+});
+
+// ================= FAVORITE / MARK UNREAD =================
+
+router.post('/inbox/threads/:id/favorite', requireUser, async (req, res, next) => {
+  try {
+    const favorite = req.body?.favorite !== false;
+    await query('UPDATE conversation_members SET favorite = $3 WHERE conversation_id = $1 AND user_id = $2', [req.params.id, req.user.id, favorite]);
+    res.json({ ok: true, favorite });
+  } catch (err) { next(err); }
+});
+
+router.post('/inbox/threads/:id/unread', requireUser, async (req, res, next) => {
+  try {
+    const marked = req.body?.marked !== false;
+    await query('UPDATE conversation_members SET marked_unread = $3 WHERE conversation_id = $1 AND user_id = $2', [req.params.id, req.user.id, marked]);
+    res.json({ ok: true, marked });
+  } catch (err) { next(err); }
+});
+
+// ================= INBOX LISTS =================
+
+router.get('/inbox/lists', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT l.id, l.title, l.created_at,
+              (SELECT count(*) FROM inbox_list_chats ilc WHERE ilc.list_id = l.id)::int AS count,
+              coalesce(array_agg(ilc.conversation_id) FILTER (WHERE ilc.conversation_id IS NOT NULL), '{}') AS chat_ids
+         FROM inbox_lists l LEFT JOIN inbox_list_chats ilc ON ilc.list_id = l.id
+        WHERE l.user_id = $1
+        GROUP BY l.id
+        ORDER BY l.created_at ASC`,
+      [req.user.id],
+    );
+    res.json(rows.map((r) => ({ id: r.id, title: r.title, count: Number(r.count) || 0, chatIds: r.chat_ids ?? [], createdAt: asIso(r.created_at) })));
+  } catch (err) { next(err); }
+});
+
+router.post('/inbox/lists', requireUser, async (req, res, next) => {
+  try {
+    const title = String(req.body?.title ?? '').trim().slice(0, 32);
+    if (!title) return res.status(400).json({ message: 'Name the list.' });
+    const id = rid();
+    const ids = [...new Set((Array.isArray(req.body?.conversationIds) ? req.body.conversationIds : []).map(String))].slice(0, 200);
+    await query('INSERT INTO inbox_lists (id, user_id, title) VALUES ($1,$2,$3)', [id, req.user.id, title]);
+    for (const conversationId of ids) {
+      await query('INSERT INTO inbox_list_chats (list_id, conversation_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [id, conversationId]);
+    }
+    res.status(201).json({ id, title, count: ids.length, chatIds: ids });
+  } catch (err) { next(err); }
+});
+
+router.delete('/inbox/lists/:id', requireUser, async (req, res, next) => {
+  try {
+    const { rowCount } = await query('DELETE FROM inbox_lists WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    res.json({ ok: rowCount > 0 });
+  } catch (err) { next(err); }
+});
+
+router.post('/inbox/lists/:id/chats', requireUser, async (req, res, next) => {
+  try {
+    const list = await query('SELECT 1 FROM inbox_lists WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (!list.rowCount) return res.status(404).json({ message: 'List not found' });
+    const conversationId = String(req.body?.conversationId ?? '');
+    const member = await query('SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2', [conversationId, req.user.id]);
+    if (!member.rowCount) return res.status(404).json({ message: 'Not a member of that chat' });
+    if (req.body?.add === false) {
+      await query('DELETE FROM inbox_list_chats WHERE list_id = $1 AND conversation_id = $2', [req.params.id, conversationId]);
+      return res.json({ ok: true, added: false });
+    }
+    await query('INSERT INTO inbox_list_chats (list_id, conversation_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.params.id, conversationId]);
+    res.json({ ok: true, added: true });
+  } catch (err) { next(err); }
+});
+
+// ================= STARRED MESSAGES =================
+
+router.get('/inbox/starred', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT ms.message_id AS id, msg.conversation_id, msg.body, msg.kind, ms.created_at,
+              CASE WHEN c.kind = 'dm' THEN (
+                SELECT coalesce(p2.display_name, 'Conversation') FROM conversation_members cm2
+                JOIN profiles p2 ON p2.user_id = cm2.user_id
+                WHERE cm2.conversation_id = c.id AND cm2.user_id <> $1 LIMIT 1)
+              ELSE coalesce(c.title, 'Group') END AS title
+         FROM message_stars ms
+         JOIN messages msg ON msg.id = ms.message_id
+         JOIN conversations c ON c.id = msg.conversation_id
+        WHERE ms.user_id = $1
+        ORDER BY ms.created_at DESC LIMIT 100`,
+      [req.user.id],
+    );
+    res.json(rows.map((r) => ({ id: r.id, conversationId: r.conversation_id, body: r.body, kind: r.kind, createdAt: asIso(r.created_at), title: r.title ?? 'Conversation' })));
+  } catch (err) { next(err); }
+});
+
+router.post('/messages/:id/star', requireUser, async (req, res, next) => {
+  try {
+    const member = await query(
+      'SELECT 1 FROM messages msg JOIN conversation_members cm ON cm.conversation_id = msg.conversation_id WHERE msg.id = $1 AND cm.user_id = $2',
+      [req.params.id, req.user.id],
+    );
+    if (!member.rowCount) return res.status(404).json({ message: 'Message not found' });
+    await query('INSERT INTO message_stars (message_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.params.id, req.user.id]);
+    res.json({ ok: true, starred: true });
+  } catch (err) { next(err); }
+});
+
+router.delete('/messages/:id/star', requireUser, async (req, res, next) => {
+  try {
+    await query('DELETE FROM message_stars WHERE message_id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    res.json({ ok: true, starred: false });
+  } catch (err) { next(err); }
+});
+
+// ================= CALLS =================
+
+router.get('/calls', requireUser, async (req, res, next) => {
+  try {
+    const me = req.user.id;
+    const { rows } = await query(
+      `SELECT c.id, c.kind, c.is_group, c.status, c.started_at, c.ended_at, c.room_code,
+              c.created_by,
+              (SELECT count(*) FROM call_participants cp2 WHERE cp2.call_id = c.id)::int AS participants
+         FROM calls c
+         JOIN call_participants cp ON cp.call_id = c.id AND cp.user_id = $1
+        ORDER BY c.started_at DESC LIMIT 50`,
+      [me],
+    );
+    res.json(rows.map((r) => ({
+      id: r.id, kind: r.kind, isGroup: Boolean(r.is_group), status: r.status,
+      startedAt: asIso(r.started_at), endedAt: asIso(r.ended_at),
+      durationSec: r.ended_at ? Math.max(0, Math.round((new Date(r.ended_at).getTime() - new Date(r.started_at).getTime()) / 1000)) : null,
+      direction: r.created_by === me ? 'outgoing' : 'incoming',
+      participants: Number(r.participants) || 1,
+      roomCode: r.room_code,
+    })));
+  } catch (err) { next(err); }
+});
+
+// ================= STORY DETAIL =================
+
+router.get('/stories/:id', requireUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT s.id, s.author_id, s.media_url, s.media_kind, s.text_body, s.background, s.created_at, s.expires_at,
+              pr.username, pr.display_name, pr.avatar_color, pr.is_verified
+         FROM stories s JOIN profiles pr ON pr.user_id = s.author_id
+        WHERE s.id = $1 AND s.expires_at > now()`,
+      [req.params.id],
+    );
+    if (!rows.length) return res.status(404).json({ message: 'That story has expired.' });
+    const r = rows[0];
+    const views = await query('SELECT count(*)::int AS n FROM story_views WHERE story_id = $1', [req.params.id]);
+    res.json({
+      id: r.id, authorId: r.author_id, username: r.username, displayName: r.display_name,
+      avatarColor: r.avatar_color, verified: Boolean(r.is_verified),
+      mediaUrl: r.media_url, mediaKind: r.media_kind, textBody: r.text_body, background: r.background,
+      createdAt: asIso(r.created_at), expiresAt: asIso(r.expires_at),
+      views: views.rows[0].n, mine: r.author_id === req.user.id,
+    });
+  } catch (err) { next(err); }
+});
+
+// ================= SOCIAL SAFETY (block / mute / restrict) =================
+
+function socialList(table, idCol) {
+  return async (req, res, next) => {
+    try {
+      const { rows } = await query(
+        `SELECT pr.user_id, pr.username, pr.display_name, pr.avatar_color, pr.is_verified
+           FROM ${table} x JOIN profiles pr ON pr.user_id = x.${idCol}
+          WHERE x.user_id = $1 ORDER BY x.created_at DESC LIMIT 200`,
+        [req.user.id],
+      );
+      res.json(rows.map((r) => ({ id: r.user_id, username: r.username, displayName: r.display_name, avatarColor: r.avatar_color, verified: Boolean(r.is_verified) })));
+    } catch (err) { next(err); }
+  };
+}
+
+router.get('/blocked', requireUser, socialList('blocks', 'blocked_id'));
+router.get('/muted', requireUser, socialList('mutes', 'muted_id'));
+router.get('/restricted', requireUser, socialList('restrictions', 'restricted_id'));
+
+function socialToggle(table, other, col) {
+  return async (req, res, next) => {
+    try {
+      const off = ['false', '0', 'off'].includes(String(req.body?.enabled).toLowerCase());
+      const target = String(req.params.userId);
+      if (off) {
+        await query(`DELETE FROM ${table} WHERE user_id = $1 AND ${col} = $2`, [req.user.id, target]);
+      } else {
+        if (target === req.user.id) return res.status(400).json({ message: 'Cannot target yourself.' });
+        await query(`INSERT INTO ${table} (user_id, ${col}) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [req.user.id, target]);
+      }
+      res.json({ ok: true, enabled: !off });
+    } catch (err) { next(err); }
+  };
+}
+
+router.post('/blocked/:userId', requireUser, socialToggle('blocks', 'blocked_id', 'blocked_id'));
+router.post('/muted/:userId', requireUser, socialToggle('mutes', 'muted_id', 'muted_id'));
+router.post('/restricted/:userId', requireUser, socialToggle('restrictions', 'restricted_id', 'restricted_id'));
+
+// ================= ACCOUNT LIFECYCLE =================
+
+router.post('/account/deactivate', requireUser, async (req, res, next) => {
+  try {
+    await query('UPDATE profiles SET deactivated_at = now(), updated_at = now() WHERE user_id = $1', [req.user.id]);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+router.post('/account/delete', requireUser, async (req, res, next) => {
+  try {
+    if (req.body?.confirm !== 'DELETE') return res.status(400).json({ message: 'Type DELETE to confirm.' });
+    const me = req.user.id;
+    // Mirror the web client: remove profile + auth rows. Profile delete cascades where FKs allow.
+    await query('DELETE FROM profiles WHERE user_id = $1', [me]).catch(() => {});
+    await query('DELETE FROM session WHERE "userId" = $1', [me]).catch(() => {});
+    await query('DELETE FROM account WHERE "userId" = $1', [me]).catch(() => {});
+    await query('DELETE FROM "user" WHERE id = $1', [me]).catch(() => {});
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ================= REPORTS =================
+
+router.post('/reports', requireUser, async (req, res, next) => {
+  try {
+    const targetKind = ['post', 'comment', 'user', 'message', 'story'].includes(req.body?.targetKind) ? req.body.targetKind : 'post';
+    const targetId = String(req.body?.targetId ?? '').slice(0, 80);
+    const category = String(req.body?.category ?? 'other').slice(0, 40);
+    const details = String(req.body?.details ?? '').slice(0, 500);
+    if (!targetId) return res.status(400).json({ message: 'Nothing to report.' });
+    const id = rid();
+    await query(
+      `INSERT INTO reports (id, reporter_id, target_kind, target_id, category, details, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'open', now())`,
+      [id, req.user.id, targetKind, targetId, category, details],
+    );
+    res.status(201).json({ ok: true, id });
+  } catch (err) { next(err); }
+});
+
 export default router;

@@ -57,11 +57,13 @@ router.post('/posts', requireUser, async (req, res, next) => {
     const body = String(req.body?.body ?? '').trim();
     if (!body) return res.status(400).json({ message: 'Say something first.' });
     if (body.length > 2800) return res.status(400).json({ message: 'Post is too long (max 2800).' });
+    const kind = req.body?.kind === 'video' ? 'video' : 'post';
+    const location = req.body?.location ? String(req.body.location).trim().slice(0, 120) : null;
     const id = rid();
     await query(
-      `INSERT INTO posts (id, author_id, body, kind, created_at, updated_at, published_at)
-       VALUES ($1, $2, $3, 'post', now(), now(), now())`,
-      [id, req.user.id, body],
+      `INSERT INTO posts (id, author_id, body, kind, location, created_at, updated_at, published_at)
+       VALUES ($1, $2, $3, $4, $5, now(), now(), now())`,
+      [id, req.user.id, body, kind, location],
     );
     const tags = [...new Set([...body.matchAll(/#([a-zA-Z0-9_]{2,40})/g)].map((m) => m[1].toLowerCase()))];
     for (const tag of tags) {
@@ -303,12 +305,14 @@ router.get('/memories', requireUser, async (req, res, next) => {
 router.post('/stories', requireUser, async (req, res, next) => {
   try {
     const text = String(req.body?.text ?? '').trim().slice(0, 500);
-    if (!text) return res.status(400).json({ message: 'A story needs text (media upload coming soon).' });
+    const mediaUrl = req.body?.mediaUrl ? String(req.body.mediaUrl).slice(0, 1500000) : null;
+    const mediaKind = mediaUrl ? (req.body?.mediaKind === 'video' ? 'video' : 'image') : 'text';
+    if (!text && !mediaUrl) return res.status(400).json({ message: 'A story needs text or media.' });
     const id = rid();
     await query(
       `INSERT INTO stories (id, author_id, media_url, media_kind, text_body, background, expires_at, created_at)
-       VALUES ($1, $2, NULL, 'text', $3, '#07090f', now() + interval '24 hours', now())`,
-      [id, req.user.id, text],
+       VALUES ($1, $2, $3, $4, $5, $6, now() + interval '24 hours', now())`,
+      [id, req.user.id, mediaUrl, mediaKind, text || null, '#07090f'],
     );
     res.status(201).json({ id });
   } catch (err) { next(err); }
@@ -326,7 +330,7 @@ router.post('/stories/:id/view', requireUser, async (req, res, next) => {
 router.get('/inbox/threads', requireUser, async (req, res, next) => {
   try {
     const { rows } = await query(
-      `SELECT c.id, c.kind, c.title, c.last_message_at, c.last_message_body, m.pinned,
+      `SELECT c.id, c.kind, c.title, c.last_message_at, c.last_message_body, m.pinned, m.favorite, m.marked_unread,
               (SELECT count(*) FROM messages msg
                 WHERE msg.conversation_id = c.id AND msg.sender_id <> $1 AND msg.deleted_at IS NULL
                   AND msg.created_at > coalesce(m.last_read_at, '-infinity'::timestamptz)) AS unread,
@@ -346,10 +350,10 @@ router.get('/inbox/threads', requireUser, async (req, res, next) => {
               ELSE false END AS online
          FROM conversations c
          JOIN conversation_members m ON m.conversation_id = c.id AND m.user_id = $1
-        WHERE m.archived = false
+        WHERE m.archived = $2
         ORDER BY m.pinned DESC, coalesce(c.last_message_at, c.created_at) DESC
         LIMIT 50`,
-      [req.user.id],
+      [req.user.id, req.query.archived === '1'],
     );
     res.json(rows.map((r) => ({
       id: r.id, name: r.name ?? 'Conversation',
@@ -358,7 +362,7 @@ router.get('/inbox/threads', requireUser, async (req, res, next) => {
       time: asIso(r.last_message_at ?? new Date()),
       unread: Number(r.unread) || 0,
       online: Boolean(r.online),
-      kind: r.kind, pinned: Boolean(r.pinned),
+      kind: r.kind, pinned: Boolean(r.pinned), favorite: Boolean(r.favorite), markedUnread: Boolean(r.marked_unread),
     })));
   } catch (err) { next(err); }
 });
@@ -889,14 +893,21 @@ router.put('/me', requireUser, async (req, res, next) => {
   try {
     const displayName = typeof req.body?.displayName === 'string' ? req.body.displayName.trim().slice(0, 60) : undefined;
     const bio = typeof req.body?.bio === 'string' ? req.body.bio.trim().slice(0, 280) : undefined;
+    const username = typeof req.body?.username === 'string' ? req.body.username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 30) : undefined;
     if (displayName !== undefined && displayName.length < 1) return res.status(400).json({ message: 'Display name cannot be empty.' });
+    if (username !== undefined) {
+      if (username.length < 3) return res.status(400).json({ message: 'Username must be at least 3 characters.' });
+      const taken = await query('SELECT 1 FROM profiles WHERE username = $1 AND user_id <> $2', [username, req.user.id]);
+      if (taken.rowCount) return res.status(409).json({ message: 'That username is taken.' });
+    }
     await query(
       `UPDATE profiles SET
          display_name = coalesce($2, display_name),
          bio = coalesce($3, bio),
+         username = coalesce($4, username),
          updated_at = now()
        WHERE user_id = $1`,
-      [req.user.id, displayName ?? null, bio ?? null],
+      [req.user.id, displayName ?? null, bio ?? null, username ?? null],
     );
     res.json(await mePayload(req.user.id));
   } catch (err) { next(err); }

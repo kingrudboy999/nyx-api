@@ -39,7 +39,8 @@ export async function readFeed(tab, meId, cursor, filters = {}) {
             (SELECT count(*) FROM posts r WHERE r.repost_of_id = p.id) AS reposts,
             coalesce(p.view_count, 0) AS views,
             EXISTS (SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = $1) AS liked,
-            (SELECT kind FROM post_media pm WHERE pm.post_id = p.id ORDER BY pm.sort_order, pm.id LIMIT 1) AS media_kind
+            (SELECT kind FROM post_media pm WHERE pm.post_id = p.id ORDER BY pm.sort_order, pm.id LIMIT 1) AS media_kind,
+            (SELECT url FROM post_media pm WHERE pm.post_id = p.id ORDER BY pm.sort_order, pm.id LIMIT 1) AS media_url
        FROM posts p JOIN profiles pr ON pr.user_id = p.author_id
       WHERE p.is_removed = false ${filter}
       ORDER BY ${order}
@@ -56,6 +57,7 @@ export async function readFeed(tab, meId, cursor, filters = {}) {
     createdAt: asIso(r.created_at),
     body: r.body,
     media: r.media_kind === 'video' ? 'video' : r.media_kind === 'image' ? 'image' : undefined,
+    mediaUrl: r.media_url ?? undefined,
     likes: Number(r.likes), comments: Number(r.comments), reposts: Number(r.reposts),
     views: Number(r.views), liked: Boolean(r.liked),
   }));
@@ -120,8 +122,8 @@ router.get('/feed', requireUser, async (req, res, next) => {
 router.get('/stories', requireUser, async (req, res, next) => {
   try {
     const { rows } = await query(
-      `SELECT DISTINCT ON (s.author_id) s.id, s.created_at,
-              pr.user_id AS author_id, pr.username, pr.display_name,
+      `SELECT DISTINCT ON (s.author_id) s.id, s.created_at, s.media_url, s.media_kind, s.text_body, s.background, s.author_id,
+              pr.user_id AS author_uid, pr.username, pr.display_name, pr.is_verified,
               EXISTS (SELECT 1 FROM story_views sv WHERE sv.story_id = s.id AND sv.user_id = $1) AS seen
          FROM stories s JOIN profiles pr ON pr.user_id = s.author_id
         WHERE s.expires_at > now()
@@ -129,8 +131,10 @@ router.get('/stories', requireUser, async (req, res, next) => {
       [req.user.id],
     );
     res.json(rows.map((r) => ({
-      id: r.id, username: r.username, displayName: r.display_name,
+      id: r.id, username: r.username, displayName: r.display_name, verified: Boolean(r.is_verified),
       avatarColor: avatarColor(r.author_id), seen: Boolean(r.seen),
+      mediaUrl: r.media_url, mediaKind: r.media_kind, textBody: r.text_body, background: r.background,
+      authorId: r.author_id, createdAt: r.created_at,
     })));
   } catch (err) { next(err); }
 });
